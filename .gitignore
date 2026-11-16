@@ -19,3 +19,4 @@ receiver.log*
 *.log
 *.log.*
 ~$*
+backend_token.txt

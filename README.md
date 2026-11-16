@@ -19,7 +19,7 @@
 2. 双击 `start_backend_receiver.cmd`，在本机输入 `parking_writer` 的 MySQL 密码。
 3. 启动日志应显示“后端判定”，两台相机映射，以及两个服务地址。
 4. 浏览器打开 <http://127.0.0.1:18081/health> 检查配置，再打开 <http://127.0.0.1:18081/events> 查看最近上报。
-5. 按下面相机配置表测试：先用一辆车完成入口识别，再用同一辆车完成出口识别。v0.2 后端在没有入场订单或已离场时会拒绝出口请求。
+5. 按下面相机配置表测试：先用一辆车完成入口识别，再用同一辆车完成出口识别。v0.7 后端在当前停车场没有入场订单或已离场时会拒绝出口请求。
 
 | 配置项 | 入口 | 出口 |
 | --- | --- | --- |
@@ -38,13 +38,21 @@
 
 ## 后端与运行参数
 
-**日常配置统一修改项目根目录的 `config.ini`，不再修改 Python 文件或启动 CMD 中的 IP。** 配置文件已填写当前后端 `http://192.168.74.85:83` 和两台相机 ID。MySQL 密码仍通过 `getpass` 在启动时输入。
+**日常配置统一修改项目根目录的 `config.ini`，不再修改 Python 文件或启动 CMD 中的 IP。** 配置文件已填写当前后端 `https://8.153.17.56` 和两台相机 ID。MySQL 密码仍通过 `getpass` 在启动时输入。
+
+新地址默认使用 HTTPS 443，入口为 `https://8.153.17.56/gate/entry`，出口为
+`https://8.153.17.56/gate/exit`。2026-11-09 只读连接检查发现证书与该 IP 不匹配
+（`IP address mismatch`）。按当前测试要求，`config.ini` 的 `[backend]` 已设置
+`verify_tls = false`，仅对本程序的后端请求跳过证书校验，仍使用 HTTPS。
+正式使用时，配置证书匹配的域名或有效 IP 证书，将 `verify_tls = true` 并重启程序。
+旧配置缺少该字段时默认启用校验；启动日志会显示当前开关状态。
+配置检查通过不代表网络或业务接口检查通过。
 
 后端服务器换 IP 时，用记事本打开 `config.ini`，修改：
 
 ```ini
 [backend]
-url = http://192.168.74.85:83
+url = https://8.153.17.56
 ```
 
 把地址改成实际后端根地址即可，不追加 `/gate/entry`、`/gate/exit` 或 `/index.html`。保存后，先在旧接收程序窗口按 Ctrl+C 停止，再双击 `start_backend_receiver.cmd`。运行中的进程不会自动重读配置。
@@ -79,9 +87,39 @@ start_backend_receiver.cmd --processing-budget 6
 
 旧的 multipart 上传练习 `start_uploader.cmd` 和 `start_local_api.cmd` 不使用本配置，不参与当前实时开闸流程。先前 Word 代码手册是修改前的源码快照；配置读取与启动方式以这里和带中文注释的 `config.ini` 为准。
 
+## 后端 v0.7 接入
+
+已接入 `X-Gate-Token` 请求头、`lotId`、HTTP 401/429 分类、`Retry-After` 和同接口限流。
+两台相机使用已确认的 `LOT-DEFAULT`；开闸与语音仍只依据有效响应中的布尔值 `lift`。
+
+完整操作说明：[后端 v0.7 升级与测试说明](output/documents/后端v0.7升级与测试说明.md)。
+
+- 凭证优先读取 `GATE_API_TOKEN` 环境变量；未设置时读取配置目录的 `backend_token.txt`。
+  本机已按用户提供的接口文档建立凭证文件；该文件被 Git 忽略，新电脑克隆代码后必须自行创建或设置环境变量。
+- `config.ini` 的 `[backend]` 新增 `lot_id`、`legacy_lot_id`、`token_env`、`token_file`、`min_interval_seconds`。
+  凭证本身不写入这个已纳入版本控制的 INI 文件。
+- 默认同一后端、同一路径在上一次请求结束后至少等待 3 秒。入口与出口独立，不同停车场和相机不会绕过同一路径限流。
+  等待时间不足以落在本次处理预算内时记录 `not_sent`，不会延迟补发。HTTP 429 的等待时间还会持久化给后续新事件使用。
+- 首次正常启动将旧 `backend_events` 事务性迁移到带停车场主键的新表，旧表保留为 `backend_events_v02`；
+  已有记录按 `legacy_lot_id=LOT-DEFAULT` 归属，状态和内容保留。迁移不重新提交历史订单。
+- 接收审计为新事件保存当时的后端地址和停车场，历史详情查询不会错误套用后来更换的停车场配置。
+  升级前缺少归属信息的审计只显示原记录并标记 `backend_context_unknown`，不猜测关联订单。
+- 新后端若采用 `server.address=127.0.0.1`，另一台接收电脑无法直接连接服务器 IP 的 83 端口。
+  此时将 `[backend] url` 配为实际可访问的代理根地址；本项目不会修改远端服务器监听设置。
+- 毫秒时间戳继续由相机识别秒数乘 1000；相机时间超过后端当前时间 10 分钟会被新版拒绝，应校时而不是伪造识别时间。
+
+`check_config.cmd` 会检查凭证能否加载，但不验证远端是否接受该凭证，也不执行数据库迁移。
+关闭旧接收进程后运行 `start_backend_receiver.cmd` 才会应用升级；不要同时运行两个版本。
+
 ## 语音播报配置与测试
 
 完整学习文档：[道闸语音播报功能使用与代码详解](output/documents/道闸语音播报功能使用与代码详解.md)，包含流程图、协议拆包、关键函数说明、CMD 启动方式和排查步骤。
+
+出口金额扩展：[出口收费金额语音说明](output/documents/出口收费金额语音说明.md)。出口获准开闸时，
+从同一次后端响应的 `data.billingAmount` 读取收费金额，播报“车牌＋金额＋十二点五零元＋可选提示语”。
+现有普通语音目录没有“本次收费”词条，因此使用 `0x2D`“金额”，不能直接把任意整句按 GBK 发送。
+入口不变；金额缺失或无效时退回原车牌播报，日志为 `voice_amount=skipped`，不会误报零元。
+有效金额日志如 `voice_amount=12.50`；无需增加配置字段，保持 `[voice] enabled=true` 并重启程序即可。
 
 已接入调试工具验证成功的 FK 控制卡 `0x22` 即时播报协议，当前默认启用，入口和出口均只读车牌。
 程序只在原有流程允许本次开闸时生成播报，使用同一份 HTTP 回复中的 `gpio_data` 和 `rs485_data`。
@@ -150,9 +188,9 @@ exit_suffix = none
 
 默认 FastAPI 处理预算为 6 秒，从内部收到请求开始计时；外层另有本机转发及发送余量。相机上传请求体单次阻塞读取超时为 5 秒。该预算不等于设备端整个网络往返的硬实时保证，需核对相机实际等待时限。
 
-后台 HTTP 连接/读取超时分别为 2/3 秒；MySQL 连接/读取/写入超时分别为 2/3/3 秒。处理预算到期后本次仅回复 ACK；同步 I/O 可能仍在结束，晚到的后端结果会保留，不会补发开闸。不能通过减小客户端超时撤销已经提交的停车订单。
+后端 HTTP 连接/读取超时上限分别为 2/3 秒，并受剩余处理预算限制；同一路径的限流等待也计入预算。MySQL 连接/读取/写入超时分别为 2/3/3 秒。处理预算到期后本次仅回复 ACK；同步 I/O 可能仍在结束，晚到的后端结果会保留，不会补发开闸。不能通过减小客户端超时撤销已经提交的停车订单。
 
-`backend_events.sqlite3` 继续按“后端地址 + 相机 ID + 识别秒 + 规范化车牌 + 方向”持久化去重。相同事件重发不会再请求后端或再输出 IO1，重启也一样。同秒同车牌的两次识别可能被合并；不同秒的重新识别可能是新事件。
+`backend_events.sqlite3` 继续按“后端地址 + 停车场 lotId + 相机 ID + 识别秒 + 规范化车牌 + 方向”持久化去重。相同事件重发不会再请求后端或再输出 IO1，重启也一样。同秒同车牌的两次识别可能被合并；不同秒的重新识别可能是新事件。
 
 若后台已经处理但相机未收到应答，当前设备协议没有可靠的执行回执，不能同时保证“绝不重复动作”和“必定开闸”。本版保留一次下发策略，并增加人工核对留痕：
 
@@ -182,6 +220,8 @@ exit_suffix = none
 | state=invalid_plate | 空车牌、虚假车牌或 plate_val 缺失 |
 | state=deadline | 本次处理超时；后端最终可能仍成功 |
 | backend_state=allowed/denied/rejected | 后端允许/不允许/业务失败 |
+| backend_state=auth_failed | HTTP 401：凭证缺失或错误，不开闸、不播报 |
+| backend_state=rate_limited | HTTP 429：记录 Retry-After，本事件不自动重试 |
 | backend_state=pending/uncertain/not_sent | 请求结果待核对/结果不确定/截止前未发送 |
 | delivery_state=written, open_signal=1 | 开闸响应已写入网络连接，**不是设备执行确认** |
 | delivery_state=written, open_signal=0 | 普通 ACK 或错误响应已写出 |
@@ -194,7 +234,8 @@ exit_suffix = none
 | 文件 | 用途 |
 | --- | --- |
 | camera_receiver.py | 启动参数、日志、两个监听服务的生命周期 |
-| config.ini | 集中配置后端地址、接收端口、相机 ID、MySQL 和语音 |
+| config.ini | 集中配置后端地址、停车场、凭证来源、限流间隔、接收端口、相机 ID、MySQL 和语音 |
+| backend_token.txt | 本地后端访问凭证（不纳入 Git，不在日志中显示） |
 | receiver_config.py | 读取配置、命令行覆盖、校验与配置摘要 |
 | check_config.cmd | 只检查配置，不连接现场设备或数据库 |
 | camera_transport.py | 面向相机的严格 HTTP 格式适配 |
@@ -222,4 +263,4 @@ exit_suffix = none
 
 `requirements.txt` 固定直接依赖版本；`requirements-lock.txt` 固定本次验证环境全部依赖，并已移除原清单中的本机构建路径。需要精确复现时在新环境执行 `python -m pip install -r requirements-lock.txt`。
 
-模拟测试通过不代表真实 MySQL 权限、相机固件、等待时限、IO 接线以及机械动作已经验证。后端 v0.2 文档注明 demo 成功时恒返回 `lift=true`，现场拒绝分支需要后端配合或使用本项目自动化测试验证。
+模拟测试通过不代表真实 MySQL 权限、相机固件、等待时限、IO 接线以及机械动作已经验证。后端 v0.7 的 demo 付费开关关闭时可同时返回 `needPay=true`、`lift=true`，接收端仍严格按 `lift` 判定；现场拒绝分支需要后端配合或使用本项目自动化测试验证。

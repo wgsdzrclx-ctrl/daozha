@@ -1,10 +1,12 @@
 """模式 5 业务处理：持久化后同步判定，任何晚到的结果都不能补发开闸。"""
+from decimal import Decimal
+import json
 import logging
 import time
 from urllib.parse import parse_qs
 
 from camera_storage import ACK, OPEN_GATE, first_gate_reply, save_photo
-from camera_voice import VoiceSettings, build_open_reply
+from camera_voice import VoiceSettings, build_open_reply, normalize_billing_amount
 
 MAX_BODY = 16 * 1024 * 1024
 log = logging.getLogger('gate.receiver')
@@ -56,11 +58,12 @@ class CameraService:
         self.voice = voice if voice is not None else VoiceSettings()
 
     def process(self, request_id, event, deadline, started):
-        def done(state, detail='', opened=False):
+        def done(state, detail='', opened=False, billing_amount=None):
             reply = ACK
             if opened:
                 try:
-                    reply = build_open_reply(event['plate_num'], event['vdc_type'], self.voice)
+                    reply = build_open_reply(event['plate_num'], event['vdc_type'], self.voice,
+                                             billing_amount=billing_amount)
                     if self.voice.enabled:
                         detail += '; voice=prepared（已组包，不代表喇叭已播报）'
                 except ValueError as error:
@@ -112,7 +115,17 @@ class CameraService:
                 state = record['state'] if record else 'unknown'
                 self.audit.backend_result(request_id, state)
                 if opened:
-                    return done('allowed', warning, opened=True)
+                    amount = None
+                    if row[3] == 'out' and self.voice.enabled:
+                        try:
+                            # 复用本次 exit 的落库响应，不重复请求后端或另算费用。
+                            response = json.loads(record['response_json'], parse_float=Decimal)
+                            amount = normalize_billing_amount(response['data'].get('billingAmount'))
+                            warning += f'; voice_amount={amount:.2f}'
+                        except (ValueError, TypeError, KeyError, AttributeError):
+                            # 金额异常只退回车牌播报，保留后端放行结果，绝不默认为 0 元。
+                            warning += '; voice_amount=skipped（金额缺失或无效，仅播报车牌及提示语）'
+                    return done('allowed', warning, opened=True, billing_amount=amount)
                 return done('no_signal', f'后端状态={state}；拒绝、重复或结果待核对；' + warning)
             if camera == self.open_camera and row[3] == 'in' and self.reply_claimer(camera, row[1], row[2]):
                 return done('direct_test_allowed', warning, opened=True)

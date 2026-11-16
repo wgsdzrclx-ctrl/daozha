@@ -51,7 +51,9 @@ def create_app(service, token, budget=6.0, lifespan=None):
             log.warning('%s 无效表单：%s', request_id, error)
             return camera_response(b'{"error_num":1,"error_str":"invalid event"}', 400)
         try:
-            await run_in_threadpool(service.audit.begin, request_id, event)
+            await run_in_threadpool(service.audit.begin, request_id, event,
+                                    service.backend.base_url if service.backend else None,
+                                    service.backend.lot_id if service.backend else None)
             remaining = budget - (time.monotonic() - started)
             if remaining <= 0:
                 raise TimeoutError
@@ -75,6 +77,9 @@ def create_app(service, token, budget=6.0, lifespan=None):
     def health():
         return {'status': 'ok', 'mode': 'backend' if service.backend else 'collection_or_direct_test',
                 'cameras': service.camera_directions, 'backend_url': service.backend.base_url if service.backend else None,
+                'backend_lot_id': service.backend.lot_id if service.backend else None,
+                'backend_auth_configured': bool(service.backend and service.backend.api_token),
+                'backend_min_interval_seconds': service.backend.min_interval if service.backend else None,
                 'processing_budget_seconds': budget, 'physical_gate_confirmation': False,
                 'voice': asdict(service.voice), 'voice_playback_confirmation': False}
 
@@ -89,7 +94,12 @@ def create_app(service, token, budget=6.0, lifespan=None):
             raise HTTPException(404, '未找到记录')
         row = rows[0]
         if service.backend and row['timestamp'] and row['plate'] and row['direction'] in ('in', 'out'):
-            row['backend'] = service.backend.lookup(row['camera'], row['timestamp'], row['plate'], row['direction'])
+            if row.get('backend_url') and row.get('lot_id'):
+                # 按事件发生时的停车场/服务器查询，不能套用后来修改的当前配置。
+                row['backend'] = service.backend.lookup(row['camera'], row['timestamp'], row['plate'], row['direction'],
+                                                        backend_url=row['backend_url'], lot_id=row['lot_id'])
+            else:
+                row['backend_context_unknown'] = True  # 升级前审计没有该信息，不猜测归属。
         return row
 
     @app.post('/events/{request_id}/review', summary='记录人工核对结果（不重试、不下发开闸）')

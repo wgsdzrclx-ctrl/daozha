@@ -16,8 +16,13 @@ class ConfigTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.path = Path(self.temp.name) / 'test.ini'
-        self.template = (ROOT / 'config.ini').read_text(encoding='utf-8-sig')
+        self.path = Path(self.temp.name) / 'config.ini'
+        self.template = (Path(__file__).parent / 'fixtures/config.ini').read_text(encoding='utf-8')
+        self.token_file = Path(self.temp.name) / 'backend_token.txt'
+        self.token_file.write_text('local-test-token', encoding='utf-8')
+        env = patch.dict(os.environ, {}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
         self.path.write_text(self.template, encoding='utf-8')
 
     def read(self, *extra):
@@ -32,10 +37,11 @@ class ConfigTests(unittest.TestCase):
         previous = Path.cwd()
         try:
             os.chdir(self.temp.name)
-            args = parse_settings([])
+            with patch('receiver_config.ROOT', Path(self.temp.name)):
+                args = parse_settings([])
         finally:
             os.chdir(previous)
-        self.assertEqual(args.config, ROOT / 'config.ini')
+        self.assertEqual(args.config, self.path)
         self.assertEqual(args.backend_url, 'http://192.168.74.85:83')
         self.assertEqual(args.entry_camera, '1803002542bd')
         self.assertEqual(args.exit_camera, '18030025462d')
@@ -52,6 +58,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(args.port, 8088)
         args = self.read('--backend-url', 'http://192.0.2.11:9001/')
         self.assertEqual(args.backend_url, 'http://192.0.2.11:9001')
+
+    def test_tls_option_keeps_old_config_secure_and_accepts_explicit_test_override(self):
+        self.assertTrue(self.read().backend_verify_tls)
+        self.path.write_text(self.template.replace('[backend]', '[backend]\nverify_tls = false'),
+                             encoding='utf-8')
+        self.assertFalse(self.read().backend_verify_tls)
+        self.assertTrue(self.read('--backend-verify-tls', 'true').backend_verify_tls)
+        self.path.write_text(self.template.replace('[backend]', '[backend]\nverify_tls = maybe'),
+                             encoding='utf-8')
+        self.invalid()
 
     def test_collection_does_not_inherit_backend(self):
         args = self.read('--collection')
@@ -82,6 +98,10 @@ class ConfigTests(unittest.TestCase):
             ('entry_address = 100', 'entry_address = 256'),
             ('exit_address = 100', 'exit_address = -1'),
             ('entry_suffix = none', 'entry_suffix = 欢迎光临'),
+            ('lot_id = LOT-DEFAULT', 'lot_id = 停车场'),
+            ('min_interval_seconds = 3', 'min_interval_seconds = nan'),
+            ('min_interval_seconds = 3', 'min_interval_seconds = -1'),
+            ('token_env = GATE_API_TOKEN', 'token_env = INVALID-NAME'),
         ]
         for before, after in replacements:
             with self.subTest(after=after):
@@ -118,6 +138,23 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(args.voice.entry_suffix, 'welcome')
         self.assertEqual(args.voice.exit_suffix, 'goodbye')
         self.assertEqual(args.voice.exit_address, 101)
+
+    def test_backend_credentials_precedence_validation_and_redaction(self):
+        args = self.read()
+        self.assertEqual(args.backend_token, 'local-test-token')
+        with patch.dict(os.environ, {'GATE_API_TOKEN': 'env-test-token'}):
+            self.assertEqual(self.read().backend_token, 'env-test-token')
+        for invalid in ['', 'secret\r\ninvalid', '中文凭证']:
+            with patch.dict(os.environ, {'GATE_API_TOKEN': invalid}):
+                self.invalid()
+        self.token_file.unlink()
+        self.invalid()
+        self.assertIsNone(self.read('--collection').backend_token)
+        with patch.dict(os.environ, {'GATE_API_TOKEN': 'DO-NOT-PRINT-THIS'}), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            camera_receiver.main(['--config', str(self.path), '--check-config'])
+        self.assertNotIn('DO-NOT-PRINT-THIS', output.getvalue())
+        self.assertIn('环境变量 GATE_API_TOKEN', output.getvalue())
 
     def test_mysql_options_reach_initial_and_event_connections(self):
         connection = MagicMock()

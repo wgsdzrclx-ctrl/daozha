@@ -38,7 +38,10 @@ def main(argv=None):
         logger.addHandler(handler)
     for line in describe_settings(args):
         logger.info('%s', line)
-    backend = GateBackend(args.backend_url) if args.backend_url else None
+    backend = (GateBackend(args.backend_url, api_token=args.backend_token, lot_id=args.backend_lot_id,
+                           min_interval=args.backend_min_interval, legacy_lot_id=args.backend_legacy_lot_id,
+                           verify_tls=args.backend_verify_tls)
+               if args.backend_url else None)
     save_event = (mysql_writer(args.mysql_user, host=args.mysql_host, port=args.mysql_port,
                               database=args.mysql_database) if args.mysql_user else save_sqlite)
     audit = ReceiverAudit(ROOT / 'receiver_audit.sqlite3')

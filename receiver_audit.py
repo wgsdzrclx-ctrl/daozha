@@ -17,6 +17,10 @@ class ReceiverAudit:
                 camera TEXT, timestamp INTEGER, plate TEXT, direction TEXT, kind TEXT,
                 state TEXT NOT NULL, detail TEXT, backend_state TEXT,
                 elapsed_ms INTEGER, finished_at TEXT)""")
+            columns = {row[1] for row in db.execute('PRAGMA table_info(receiver_events)')}
+            for name in ('backend_url', 'lot_id'):
+                if name not in columns:
+                    db.execute(f'ALTER TABLE receiver_events ADD COLUMN {name} TEXT')
             db.execute("""CREATE TABLE IF NOT EXISTS receiver_deliveries (
                 request_id TEXT PRIMARY KEY, state TEXT, open_signal INTEGER,
                 detail TEXT, updated_at TEXT)""")
@@ -26,13 +30,13 @@ class ReceiverAudit:
     def connect(self):
         return sqlite3.connect(self.path, timeout=0.5)
 
-    def begin(self, request_id, event):
+    def begin(self, request_id, event, backend_url=None, lot_id=None):
         with closing(self.connect()) as db, db:
             db.execute("""INSERT INTO receiver_events
-                (request_id,received_at,camera,timestamp,plate,direction,kind,state)
-                VALUES (?,?,?,?,?,?,?,'processing')""",
+                (request_id,received_at,camera,timestamp,plate,direction,kind,state,backend_url,lot_id)
+                VALUES (?,?,?,?,?,?,?,'processing',?,?)""",
                 (request_id, now(), event.get('cam_id'), event.get('start_time'),
-                 event.get('plate_num'), event.get('vdc_type'), event.get('type')))
+                 event.get('plate_num'), event.get('vdc_type'), event.get('type'), backend_url, lot_id))
 
     def finish(self, request_id, state, detail, elapsed_ms):
         with closing(self.connect()) as db, db:

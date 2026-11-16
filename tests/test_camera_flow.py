@@ -38,11 +38,14 @@ class FakeBackend(BaseHTTPRequestHandler):
     def do_POST(self):
         payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         self.server.calls.append((self.path, payload, self.headers['Content-Type']))
+        self.server.tokens.append(self.headers.get('X-Gate-Token'))
         time.sleep(self.server.delay)
         reply = self.server.reply(payload)
         body = reply if isinstance(reply, bytes) else json.dumps(reply).encode()
         self.send_response(self.server.status)
         self.send_header('Content-Length', str(len(body)))
+        for key, value in self.server.extra_headers.items():
+            self.send_header(key, value)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -57,10 +60,12 @@ class FlowTests(unittest.TestCase):
         self.fake = ThreadingHTTPServer(('127.0.0.1', 0), FakeBackend)
         self.fake.daemon_threads = True
         self.fake.calls, self.fake.delay, self.fake.status = [], 0, 200
-        self.fake.reply = lambda p: {'code': 200, 'data': {'carNo': p['carNo'], 'lift': True, 'orderId': 1}}
+        self.fake.tokens, self.fake.extra_headers = [], {}
+        self.fake.reply = lambda p: {'code': 200, 'data': {'carNo': p['carNo'], 'lotId': p['lotId'], 'lift': True, 'orderId': 1}}
         self.fake_thread = threading.Thread(target=self.fake.serve_forever, kwargs={'poll_interval': 0.02}, daemon=True)
         self.fake_thread.start()
-        self.backend = GateBackend(f'http://127.0.0.1:{self.fake.server_port}', self.root / 'backend.db')
+        self.backend = GateBackend(f'http://127.0.0.1:{self.fake.server_port}', self.root / 'backend.db',
+                                   api_token='test-backend-token', min_interval=0)
         self.audit = ReceiverAudit(self.root / 'audit.db')
         self.saved = []
         self.service = CameraService(self.saved.append, self.audit, self.backend,
@@ -112,13 +117,101 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(self.post(), (200, OPEN_GATE))
         path, payload, content_type = self.fake.calls[0]
         self.assertEqual(path, '/gate/entry')
-        self.assertEqual(payload, {'carNo': '皖MF58780', 'entryTime': 1793865600000})
+        self.assertEqual(payload, {'carNo': '皖MF58780', 'lotId': 'LOT-DEFAULT', 'entryTime': 1793865600000})
         self.assertEqual(content_type, 'application/json')
+        self.assertEqual(self.fake.tokens, ['test-backend-token'])
 
     def test_exit_json_and_open_signal(self):
         self.assertEqual(self.post(cam_id=EXIT_CAMERA, vdc_type='out'), (200, OPEN_GATE))
         self.assertEqual(self.fake.calls[0][0], '/gate/exit')
         self.assertIn('exitTime', self.fake.calls[0][1])
+
+    def test_exit_amount_is_from_saved_response_and_duplicate_is_silent(self):
+        self.service.voice = VoiceSettings(True, exit_suffix='goodbye')
+        self.fake.reply = lambda p: {'code': 200, 'data': {
+            'carNo': p['carNo'], 'lotId': p['lotId'], 'lift': True, 'billingAmount': 12.50}}
+        status, body = self.post(cam_id=EXIT_CAMERA, vdc_type='out')
+        self.assertEqual(status, 200)
+        self.assertTrue(validate_camera_reply(body))
+        frame = bytes.fromhex(json.loads(body)['rs485_data'][0]['data'])
+        self.assertEqual(frame[8:-3], '皖MF58780'.encode('gbk') +
+                         b'\x2D' + '十2点50元'.encode('gbk') + b'\x02')
+        self.assertIn('voice_amount=12.50', self.audit.recent()[0]['detail'])
+        self.assertEqual(self.post(cam_id=EXIT_CAMERA, vdc_type='out'), (200, ACK))
+        self.assertEqual(len(self.fake.calls), 1)  # 播报不产生第二次 exit 调用。
+
+    def test_exit_missing_or_invalid_amount_keeps_plate_voice(self):
+        self.service.voice = VoiceSettings(True)
+        for i, fields in enumerate(({}, {'billingAmount': None}, {'billingAmount': -1},
+                                    {'billingAmount': True}, {'billingAmount': 'oops'},
+                                    {'billingAmount': 'NaN'}, {'billingAmount': 100000000})):
+            self.fake.reply = lambda p, fields=fields: {'code': 200, 'data': {
+                'carNo': p['carNo'], 'lotId': p['lotId'], 'lift': True, **fields}}
+            with self.subTest(fields=fields):
+                self.assertEqual(self.post(cam_id=EXIT_CAMERA, vdc_type='out',
+                                           start_time=str(1793865600 + i)),
+                                 (200, build_open_reply('皖MF58780', 'out', self.service.voice)))
+                self.assertIn('voice_amount=skipped', self.audit.recent()[0]['detail'])
+        self.assertEqual(len(self.fake.calls), 7)
+
+    def test_amount_does_not_change_entry_or_denied_exit(self):
+        self.service.voice = VoiceSettings(True)
+        for i, (camera, direction, lift, amount) in enumerate((
+                (ENTRY_CAMERA, 'in', True, 12.5), (EXIT_CAMERA, 'out', False, 12.5),
+                (EXIT_CAMERA, 'out', True, 0))):
+            self.fake.reply = lambda p, lift=lift, amount=amount: {'code': 200, 'data': {
+                'carNo': p['carNo'], 'lotId': p['lotId'], 'lift': lift, 'billingAmount': amount}}
+            with self.subTest(direction=direction, lift=lift, amount=amount):
+                status, body = self.post(cam_id=camera, vdc_type=direction,
+                                         start_time=str(1793865600 + i))
+                self.assertEqual(status, 200)
+                expected = build_open_reply('皖MF58780', direction, self.service.voice,
+                                            billing_amount=amount) if lift else ACK
+                self.assertEqual(body, expected)
+
+    def test_v07_auth_and_rate_limit_are_silent_and_persisted(self):
+        self.service.voice = VoiceSettings(True)
+        for status, state in [(401, 'auth_failed'), (429, 'rate_limited')]:
+            with self.subTest(status=status):
+                self.fake.status = status
+                self.fake.reply = lambda p: {'code': self.fake.status, 'msg': 'test-backend-token rejected'}
+                self.fake.extra_headers = {'Retry-After': '3'} if status == 429 else {}
+                changes = {'start_time': str(1793865600 + status)}
+                self.assertEqual(self.post(**changes), (200, ACK))
+                record = self.audit.recent()[0]
+                self.assertEqual(record['backend_state'], state)
+                result = self.get('/events/' + record['request_id'])[1]
+                self.assertEqual(result['backend']['http_status'], status)
+                self.assertNotIn('test-backend-token', json.dumps(result))
+                if status == 429:
+                    self.assertEqual(result['backend']['retry_after'], 3)
+                calls = len(self.fake.calls)
+                self.assertEqual(self.post(**changes), (200, ACK))
+                self.assertEqual(len(self.fake.calls), calls)
+
+    def test_v07_payment_and_lot_validation(self):
+        self.service.voice = VoiceSettings(True)
+        for i, lift in enumerate((True, False)):
+            self.fake.reply = lambda p, lift=lift: {'code': 200, 'data': {
+                'carNo': p['carNo'], 'lotId': p['lotId'], 'needPay': True, 'lift': lift}}
+            status, body = self.post(start_time=str(1793865600 + i))
+            self.assertEqual(status, 200)
+            self.assertEqual(validate_camera_reply(body), lift)
+        for i, lot in enumerate(('OTHER-LOT', None), 2):
+            self.fake.reply = lambda p, lot=lot: {'code': 200, 'data': {
+                'carNo': p['carNo'], 'lotId': lot, 'lift': True}}
+            self.assertEqual(self.post(start_time=str(1793865600 + i)), (200, ACK))
+            self.assertEqual(self.audit.recent()[0]['backend_state'], 'uncertain')
+
+    def test_v07_historical_audit_uses_original_context(self):
+        self.assertEqual(self.post(), (200, OPEN_GATE))
+        request_id = self.audit.recent()[0]['request_id']
+        self.service.backend = GateBackend('http://127.0.0.1:1', self.backend.journal,
+                                           lot_id='ANOTHER-LOT', api_token='different-token', min_interval=0)
+        result = self.get('/events/' + request_id)[1]
+        self.assertEqual(result['lot_id'], 'LOT-DEFAULT')
+        self.assertEqual(result['backend']['state'], 'allowed')
+        self.assertNotIn('different-token', json.dumps(self.get('/health')[1]))
 
     def test_voice_entry_exit_and_health(self):
         self.service.voice = VoiceSettings(True, 100, 101, 'welcome', 'goodbye')
@@ -141,7 +234,7 @@ class FlowTests(unittest.TestCase):
 
     def test_voice_denied_offline_heartbeat_and_invalid_events_are_silent(self):
         self.service.voice = VoiceSettings(True)
-        self.fake.reply = lambda p: {'code': 200, 'data': {'carNo': p['carNo'], 'lift': False}}
+        self.fake.reply = lambda p: {'code': 200, 'data': {'carNo': p['carNo'], 'lotId': p['lotId'], 'lift': False}}
         for changes in [{}, {'type': 'heartbeat'}, {'type': 'offline'}, {'plate_val': 'false'},
                         {'cam_id': 'unknown'}, {'encrypt_verify': 'false'}]:
             with self.subTest(changes=changes):
@@ -154,7 +247,8 @@ class FlowTests(unittest.TestCase):
             results = list(pool.map(lambda _: self.post(), range(4)))
         self.assertEqual(results.count((200, expected)), 1)
         self.assertEqual(results.count((200, ACK)), 3)
-        self.service.backend = GateBackend(self.backend.base_url, self.backend.journal)
+        self.service.backend = GateBackend(self.backend.base_url, self.backend.journal,
+                                           api_token='test-backend-token', min_interval=0)
         self.assertEqual(self.post(), (200, ACK))
         self.assertEqual(len(self.fake.calls), 1)
 
@@ -173,7 +267,7 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(self.post(plate_num='粤B12345🙂'), (200, ACK))
 
     def test_denied(self):
-        self.fake.reply = lambda p: {'code': 200, 'data': {'carNo': p['carNo'], 'lift': False}}
+        self.fake.reply = lambda p: {'code': 200, 'data': {'carNo': p['carNo'], 'lotId': p['lotId'], 'lift': False}}
         self.assertEqual(self.post(), (200, ACK))
 
     def test_rejected(self):
@@ -182,7 +276,7 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(self.audit.recent()[0]['backend_state'], 'rejected')
 
     def test_duplicate_true_still_uses_lift(self):
-        self.fake.reply = lambda p: {'code': 200, 'data': {'carNo': p['carNo'], 'lift': True, 'duplicate': True}}
+        self.fake.reply = lambda p: {'code': 200, 'data': {'carNo': p['carNo'], 'lotId': p['lotId'], 'lift': True, 'duplicate': True}}
         self.assertEqual(self.post(), (200, OPEN_GATE))
 
     def test_malformed_backend_and_plate_mismatch_fail_closed(self):
@@ -210,7 +304,8 @@ class FlowTests(unittest.TestCase):
 
     def test_persistent_duplicate_after_backend_recreation(self):
         self.assertEqual(self.post(), (200, OPEN_GATE))
-        self.service.backend = GateBackend(self.backend.base_url, self.backend.journal)
+        self.service.backend = GateBackend(self.backend.base_url, self.backend.journal,
+                                           api_token='test-backend-token', min_interval=0)
         self.assertEqual(self.post(), (200, ACK))
         self.assertEqual(len(self.fake.calls), 1)
 
@@ -254,7 +349,7 @@ class FlowTests(unittest.TestCase):
         time.sleep(0.45)
         record = self.audit.recent()[0]
         self.assertEqual(record['state'], 'deadline')
-        self.assertEqual(record['backend_state'], 'allowed')
+        self.assertEqual(record['backend_state'], 'uncertain')
         self.assertEqual(record['open_signal'], 0)
         self.assertEqual(self.post(), (200, ACK))
         self.assertEqual(len(self.fake.calls), 1)
